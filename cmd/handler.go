@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"github.com/devkanro/pvg/lib"
 	"image"
 	"image/color"
 	_ "image/gif"
@@ -12,61 +11,152 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
+
+	"github.com/devkanro/pvg/lib"
 )
 
-func handleDir(input string, output string, transparent color.Color) error {
+func handleDir(input string, output string, transparent color.Color, options lib.Options) error {
 	files, err := ioutil.ReadDir(input)
 	if err != nil {
 		return err
 	}
 
-	stat, _ := os.Stat(output)
-	if stat == nil {
-		err = os.MkdirAll(output, os.ModeDir)
-	} else if !stat.IsDir() {
+	stat, statErr := os.Stat(output)
+	if statErr == nil && !stat.IsDir() {
 		return fmt.Errorf("output '%s' must be a folder in batch mode", output)
+	}
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return statErr
+	}
+
+	// Work out every input/output pair up front so output conflicts are
+	// reported before anything is written. ioutil.ReadDir sorts by file name,
+	// and the conflict check below does not depend on which worker runs first,
+	// so batch output is reproducible even in parallel mode.
+	pairs, err := buildFilePairs(input, output, files)
+	if err != nil {
+		return err
+	}
+
+	if statErr != nil {
+		if err = os.MkdirAll(output, 0755); err != nil {
+			return err
+		}
 	}
 
 	if parallel {
 		var waitGroup sync.WaitGroup
 		cpus := runtime.NumCPU()
+		if cpus > len(pairs) {
+			cpus = len(pairs)
+		}
+		if cpus < 1 {
+			cpus = 1
+		}
 		waitGroup.Add(cpus)
 		for i := 0; i < cpus; i++ {
 			go func(group int) {
-				handleFolderGroup(input, output, transparent, files, cpus, group)
+				handleFolderGroup(pairs, cpus, group, transparent, options)
 				waitGroup.Done()
 			}(i)
 		}
 		waitGroup.Wait()
-	}else {
-		handleFolderGroup(input, output, transparent, files, -1, -1)
+	} else {
+		handleFolderGroup(pairs, 1, 0, transparent, options)
 	}
 
 	return nil
 }
 
-func handleFolderGroup(input string, output string, transparent color.Color, files []os.FileInfo, groupCount int, group int) {
-	for i, file := range files {
+type filePair struct {
+	input  string
+	output string
+}
+
+// buildFilePairs maps every convertible file in files to its output path.
+// Files that are not decodable images are still visited and reported by
+// handleFile, exactly like before. Two situations would silently lose output,
+// so they are rejected explicitly instead of depending on scheduling order:
+//
+//   - two inputs whose base names collide (a.png and a.jpg both map to a.svg);
+//   - an output that is also an input of the same batch (only possible when
+//     converting a folder in place, e.g. a.png alongside a.svg).
+func buildFilePairs(input string, output string, files []os.FileInfo) ([]filePair, error) {
+	pairs := make([]filePair, 0, len(files))
+	seen := make(map[string]string, len(files))
+	inputs := make(map[string]string, len(files))
+
+	inputRoot, err := filepath.Abs(input)
+	if err != nil {
+		return nil, err
+	}
+	outputRoot, err := filepath.Abs(output)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, file := range files {
 		if file.IsDir() {
 			continue
 		}
-		if group < 0 || groupCount <= 0 || i % groupCount == group {
-			basename := file.Name()
-			basename = basename[:len(basename)-len(filepath.Ext(basename))]
-			err := handleFile(filepath.Join(input, file.Name()), filepath.Join(output, basename+".svg"), transparent)
-			if err != nil {
-				fmt.Printf("Skip convert file '%s' due to error: %s\n", file.Name(), err)
-			}
+		inputs[filepath.Join(inputRoot, file.Name())] = file.Name()
+	}
+
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		name := file.Name()
+		basename := strings.TrimSuffix(name, filepath.Ext(name))
+		target := filepath.Join(outputRoot, basename+".svg")
+
+		if previous, ok := seen[target]; ok {
+			return nil, fmt.Errorf("output conflict: '%s' and '%s' both map to '%s'", previous, name, target)
+		}
+		if source, ok := inputs[target]; ok {
+			return nil, fmt.Errorf("output conflict: '%s' would overwrite input file '%s'", name, source)
+		}
+		seen[target] = name
+		pairs = append(pairs, filePair{
+			input:  filepath.Join(input, name),
+			output: filepath.Join(output, basename+".svg"),
+		})
+	}
+
+	return pairs, nil
+}
+
+func handleFolderGroup(pairs []filePair, groupCount int, group int, transparent color.Color, options lib.Options) {
+	for i, pair := range pairs {
+		if groupCount > 1 && i%groupCount != group {
+			continue
+		}
+		if err := handleFile(pair.input, pair.output, transparent, options); err != nil {
+			fmt.Printf("Skip convert file '%s' due to error: %s\n", filepath.Base(pair.input), err)
 		}
 	}
 }
 
-func handleFile(input string, output string, transparent color.Color) error {
+func handleFile(input string, output string, transparent color.Color, options lib.Options) (err error) {
+	inputPath, err := filepath.Abs(input)
+	if err != nil {
+		return err
+	}
+	outputPath, err := filepath.Abs(output)
+	if err != nil {
+		return err
+	}
+	if samePath(inputPath, outputPath) {
+		return fmt.Errorf("input and output are the same file '%s'", inputPath)
+	}
+
 	file, err := os.Open(input)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 
 	img, format, err := image.Decode(file)
 	if err != nil {
@@ -74,17 +164,34 @@ func handleFile(input string, output string, transparent color.Color) error {
 	}
 	fmt.Printf("%s>>svg: '%s'.\n", format, input)
 
+	if err = os.MkdirAll(filepath.Dir(output), 0755); err != nil {
+		return err
+	}
+
 	outputFile, err := os.Create(output)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if closeErr := outputFile.Close(); err == nil {
+			err = closeErr
+		}
+	}()
 
-	_, err = outputFile.WriteString(lib.Convert(img, transparent))
-	if err != nil {
-		return err
+	_, err = outputFile.WriteString(lib.Convert(img, transparent, options))
+	return err
+}
+
+func samePath(a, b string) bool {
+	if a == b {
+		return true
 	}
-
-	return nil
+	aInfo, aErr := os.Stat(a)
+	bInfo, bErr := os.Stat(b)
+	if aErr == nil && bErr == nil {
+		return os.SameFile(aInfo, bInfo)
+	}
+	return false
 }
 
 func parseHexColor(s string) (c color.RGBA, err error) {
